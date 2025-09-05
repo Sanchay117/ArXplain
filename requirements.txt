@@ -1,0 +1,17 @@
+# Core
+transformers>=4.35.0
+datasets>=2.13.0
+accelerate>=0.20.0
+torch>=2.2.0
+trl>=0.6.0
+peft>=0.4.0
+safetensors>=0.3.0
+sentencepiece
+huggingface_hub
+fastapi
+uvicorn
+textstat
+
+# Notes:
+# - On macOS M4, install torch with MPS support (see README for exact pip command).
+# - bitsandbytes is NOT required for MPS runs; add bitsandbytes only on Linux/CUDA cloud for QLoRA.
