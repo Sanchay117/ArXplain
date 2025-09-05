@@ -1,6 +1,6 @@
 # Core
 transformers>=4.35.0
-datasets>=2.13.0
+datasets==3.6.0
 accelerate>=0.20.0
 torch>=2.2.0
 trl>=0.6.0
