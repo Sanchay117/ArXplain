@@ -47,10 +47,41 @@ COMMON_TARGET_FIELDS = [
 ]
 
 
+MAX_SHARD_SIZE_MB = 30
+MAX_SHARD_SIZE_BYTES = MAX_SHARD_SIZE_MB * 1024 * 1024
+
 def write_jsonl(path: Path, examples: List[dict]):
-    with open(path, "a", encoding="utf-8") as f:
-        for ex in examples:
-            f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+    """
+    Write examples to JSONL, sharding into multiple files if file size >30MB.
+    Output files are named path.stem + _part{n}.jsonl
+    Example: train_xsum_part1.jsonl, train_xsum_part2.jsonl
+    """
+    base = path.stem   # e.g., "train_xsum"
+    suffix = path.suffix or ".jsonl"
+
+    shard_idx = 1
+    shard_size = 0
+    shard_file = open(path.with_name(f"{base}_part{shard_idx}{suffix}"), "w", encoding="utf-8")
+
+    for ex in examples:
+        line = json.dumps(ex, ensure_ascii=False) + "\n"
+        encoded = line.encode("utf-8")
+        line_size = len(encoded)
+
+        # roll over if adding this line would exceed max shard size
+        if shard_size + line_size > MAX_SHARD_SIZE_BYTES:
+            shard_file.close()
+            print(f"  -> wrote shard {shard_idx} ({shard_size/1e6:.2f} MB)")
+            shard_idx += 1
+            shard_size = 0
+            shard_file = open(path.with_name(f"{base}_part{shard_idx}{suffix}"), "w", encoding="utf-8")
+
+        shard_file.write(line)
+        shard_size += line_size
+
+    shard_file.close()
+    print(f"  -> wrote shard {shard_idx} ({shard_size/1e6:.2f} MB)")
+    print(f"Shards written to {path.parent} with base '{base}'")
 
 
 def detect_fields(example: dict, input_field: Optional[str], target_field: Optional[str]):
@@ -107,43 +138,120 @@ def extract_examples_from_split(dataset_id: str, config: Optional[str], split: s
                                 max_examples: Optional[int], use_all: bool,
                                 input_field: Optional[str], target_field: Optional[str]):
     """
-    Loads one dataset split and yields (input, target) formatted dicts
+    Robust loader:
+      - If split == "all": iterate ["train","validation","test"] and concatenate.
+      - For each split, build a slice argument properly (not None) so load_dataset loads rows.
+      - Handles dict rows and string rows (string rows must contain a separator).
+      - Respects explicit input_field/target_field if provided.
     """
-    slice_arg = None if use_all else (f"{split}[:{max_examples}]" if max_examples else split)
-    print(f"Loading {dataset_id} config={config} split={slice_arg} ...")
-    ds = load_dataset(dataset_id, config, split=slice_arg) if config else load_dataset(dataset_id, split=slice_arg)
-    print(f" -> loaded {len(ds)} rows from {dataset_id} / {split}")
+    def load_one(split_name):
+        # build slice arg: if user wants all for this split, pass split_name; otherwise use slicing
+        slice_arg = split_name if use_all else (f"{split_name}[:{max_examples}]" if max_examples else split_name)
+        print(f"  loading {dataset_id} config={config} split={slice_arg} ...")
+        if config:
+            ds_part = load_dataset(dataset_id, config, split=slice_arg)
+        else:
+            ds_part = load_dataset(dataset_id, split=slice_arg)
+        print(f"   -> {len(ds_part)} rows")
+        return ds_part
+
+    splits_to_load = []
+    if split == "all":
+        splits_to_load = ["train", "validation", "test"]
+    else:
+        splits_to_load = [split]
 
     extracted = []
-    for item in ds:
-        # Decide fields to use for this item
-        inf, tf = detect_fields(item, input_field, target_field)
+    total_skipped = 0
+    for sp in splits_to_load:
+        ds_part = load_one(sp)
 
-        # If detection failed, try to be more aggressive: check all keys
-        if not inf:
-            for k in item.keys():
-                if any(sub in k.lower() for sub in ["abstract", "source", "paper", "body", "article"]):
-                    inf = k; break
-        if not tf:
-            for k in item.keys():
-                if any(sub in k.lower() for sub in ["tldr", "summary", "target", "highlights", "abstract"]):
-                    tf = k; break
+        # iterate rows in the split
+        skipped = 0
+        for raw_item in ds_part:
+            # normalize raw_item
+            if isinstance(raw_item, dict):
+                item = raw_item
+            else:
+                # treat non-dict as string-like
+                item = {"_single_text": str(raw_item)}
 
-        if not inf or not tf:
-            # can't extract from this row
-            continue
+            # if explicit fields given, use them
+            inf, tf = detect_fields(item, input_field, target_field)
 
-        abstract = normalize_text(item.get(inf))
-        target = normalize_text(item.get(tf))
+            # if explicit fields not discovered and item is dict, try heuristics
+            if not inf and isinstance(item, dict):
+                for k in item.keys():
+                    kl = k.lower()
+                    if any(sub in kl for sub in ["abstract", "source", "paper", "body", "article", "document", "doc", "text"]):
+                        inf = k; break
+            if not tf and isinstance(item, dict):
+                for k in item.keys():
+                    kl = k.lower()
+                    if any(sub in kl for sub in ["tldr", "summary", "target", "highlights", "headline", "summary_text"]):
+                        tf = k; break
 
-        if not abstract or not target:
-            continue
+            # If item is a single text under _single_text, try parsing it as "input SEP output"
+            if (not inf or not tf) and "_single_text" in item:
+                s = item["_single_text"].strip()
+                # try separators and newline split
+                inp, outp = None, None
+                for sep in ["\t", " ||| ", "|||", " ### ", "###", " || ", "||"]:
+                    if sep in s:
+                        parts = s.split(sep, 1)
+                        inp = parts[0].strip(); outp = parts[1].strip()
+                        break
+                if not inp and "\n" in s:
+                    head, rest = s.split("\n", 1)
+                    inp = head.strip(); outp = rest.strip()
+                if inp and outp:
+                    abstract = normalize_text(inp)
+                    target = normalize_text(outp)
+                    if abstract and target:
+                        ex_item = {
+                            "instruction": f"[SOURCE={dataset_id}] Summarize the abstract in simple plain English for a non-expert (5th-grade level).",
+                            "input": abstract,
+                            "output": target,
+                            "source": dataset_id,
+                        }
+                        extracted.append(ex_item)
+                        continue
+                # otherwise skip this row
+                skipped += 1
+                continue
 
-        extracted.append({
-            "instruction": "Summarize the abstract in simple plain English for a non-expert (5th-grade level).",
-            "input": abstract,
-            "output": target
-        })
+            # last-resort: if item is dict and we still don't have fields, try first two keys
+            if (not inf or not tf) and isinstance(item, dict) and len(item.keys()) >= 2:
+                keys = list(item.keys())
+                if not inf:
+                    inf = keys[0]
+                if not tf and len(keys) > 1:
+                    tf = keys[1]
+
+            if not inf or not tf:
+                skipped += 1
+                continue
+
+            abstract = normalize_text(item.get(inf))
+            target = normalize_text(item.get(tf))
+            if not abstract or not target:
+                skipped += 1
+                continue
+
+            ex_item = {
+                "instruction": f"[SOURCE={dataset_id}] Summarize the abstract in simple plain English for a non-expert (5th-grade level).",
+                "input": abstract,
+                "output": target,
+                "source": dataset_id,
+            }
+            extracted.append(ex_item)
+
+        if skipped:
+            print(f"   (skipped {skipped} unusable rows from {dataset_id}/{sp})")
+        total_skipped += skipped
+
+    if total_skipped:
+        print(f"  (total skipped across splits: {total_skipped})")
     return extracted
 
 
