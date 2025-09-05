@@ -45,16 +45,56 @@ def convert_scitldr_example(ex):
     Extract abstract and tldr from a scitldr example defensively.
     Returns (abstract, tldr) or (None, None) if extraction fails.
     """
-    abstract = ex.get("source") or ex.get("paper_abstract") or ex.get("abstract") or ""
+    # Abstract can sometimes be in different fields and sometimes be a list
+    abstract = ex.get("source") or ex.get("paper_abstract") or ex.get("abstract") or ex.get("text") or ""
+    if isinstance(abstract, list):
+        # join lists of strings into one string
+        abstract = " ".join([str(x) for x in abstract if x is not None])
+    # Normalize abstract to string
+    abstract = str(abstract).strip()
+
+    # Target (tldr) can be a string, list, or missing
     target = ex.get("target")
-    if isinstance(target, list) and target:
-        target = target[0]
-    if target is None:
-        target = ex.get("summary") or ex.get("tldr") or ""
+    if isinstance(target, list):
+        # if list of strings, join them; if list of dicts, try to extract text-like fields
+        try:
+            # simple join for list of primitives
+            if all(not isinstance(t, dict) for t in target):
+                target = " ".join([str(t) for t in target if t is not None])
+            else:
+                # handle list of dicts (defensive): try common keys
+                pieces = []
+                for t in target:
+                    if isinstance(t, dict):
+                        # prefer 'text' or 'summary' or first string-like field
+                        if "text" in t:
+                            pieces.append(str(t["text"]))
+                        elif "summary" in t:
+                            pieces.append(str(t["summary"]))
+                        else:
+                            # pick first string-ish field
+                            for v in t.values():
+                                if isinstance(v, str):
+                                    pieces.append(v); break
+                    else:
+                        pieces.append(str(t))
+                target = " ".join(pieces)
+        except Exception:
+            # fallback: stringify entire list
+            target = " ".join([str(t) for t in target])
+    elif isinstance(target, dict):
+        # sometimes target is a dict with text under a key
+        target = target.get("text") or target.get("summary") or str(target)
+    # normalize to string
+    target = str(target).strip() if target is not None else ""
+
     if not abstract or not target:
         return None, None
-    return abstract.replace("\n", " "), str(target).replace("\n", " ")
+    # remove newlines and normalize whitespace
+    abstract = " ".join(abstract.split())
+    target = " ".join(target.split())
 
+    return abstract, target
 
 def load_scitldr_all(config_name: str, split: str, max_examples: int = None, use_all: bool = False):
     """
